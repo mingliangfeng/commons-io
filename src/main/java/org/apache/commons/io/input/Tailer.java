@@ -20,10 +20,12 @@ import static org.apache.commons.io.IOUtils.EOF;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.charset.Charset;
+import java.nio.file.FileSystemException;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.StandardOpenOption;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
@@ -122,8 +124,6 @@ public class Tailer implements Runnable {
 
     private static final int DEFAULT_DELAY_MILLIS = 1000;
 
-    private static final String RAF_MODE = "r";
-
     private static final int DEFAULT_BUFSIZE = 4096;
 
     // The default charset used for reading files
@@ -168,6 +168,17 @@ public class Tailer implements Runnable {
      * The tailer will run as long as this value is true.
      */
     private volatile boolean run = true;
+    
+    /**
+     * Current position of the file tail has read to reading buffer
+     */
+    private long position;
+    
+    /**
+     * Reading buffer with content that has not been sent to listener due to
+     * incomplete line
+     */
+    private ByteArrayOutputStream lineBuf = new ByteArrayOutputStream(64);
 
     /**
      * Creates a Tailer for the given file, starting from the beginning, with the default delay of 1.0s.
@@ -395,26 +406,16 @@ public class Tailer implements Runnable {
      * Follows changes in the file, calling the TailerListener's handle method for each new line.
      */
     public void run() {
-        RandomAccessFile reader = null;
+    	CountingInputStream reader = null;
         try {
             long last = 0; // The last time the file was checked for changes
-            long position = 0; // position within the file
             // Open the file
-            while (getRun() && reader == null) {
-                try {
-                    reader = new RandomAccessFile(file, RAF_MODE);
-                } catch (final FileNotFoundException e) {
-                    listener.fileNotFound();
-                }
-                if (reader == null) {
-                    Thread.sleep(delayMillis);
-                } else {
-                    // The current position in the file
-                    position = end ? file.length() : 0;
-                    last = file.lastModified();
-                    reader.seek(position);
-                }
-            }
+            reader = waitIfFileDoesNotExist();
+            if (reader == null) return;
+            
+        	last = file.lastModified();
+        	position = end ? file.length() : 0;
+            position = reader.skip(position);
             while (getRun()) {
                 final boolean newer = FileUtils.isFileNewer(file, last); // IO-279, must be done first
                 // Check the file length to see if it was rotated
@@ -422,43 +423,39 @@ public class Tailer implements Runnable {
                 if (length < position) {
                     // File was rotated
                     listener.fileRotated();
-                    // Reopen the reader after rotation
+                    // At this point, we're sure that the old file is rotated
+                    // Finish scanning the old file and then we'll start with the new one
                     try {
-                        // Ensure that the old file is closed iff we re-open it successfully
-                        final RandomAccessFile save = reader;
-                        reader = new RandomAccessFile(file, RAF_MODE);
-                        // At this point, we're sure that the old file is rotated
-                        // Finish scanning the old file and then we'll start with the new one
-                        try {
-                            readLines(save);
-                        }  catch (IOException ioe) {
-                            listener.handle(ioe);
-                        }
-                        position = 0;
-                        // close old file explicitly rather than relying on GC picking up previous RAF
-                        IOUtils.closeQuietly(save);
-                    } catch (final FileNotFoundException e) {
-                        // in this case we continue to use the previous reader and position values
-                        listener.fileNotFound();
+                        readLines(reader, true);
+                    }  catch (IOException ioe) {
+                        listener.handle(ioe);
                     }
+                    // close old file explicitly rather than relying on GC picking up previous RAF
+                    IOUtils.closeQuietly(reader);
+                    
+                    reader = waitIfFileDoesNotExist();
+                    position = 0;
+                    if (reader == null) break;
                     continue;
                 } else {
                     // File was not rotated
                     // See if the file needs to be read again
                     if (length > position) {
                         // The file has more content than it did last time
-                        position = readLines(reader);
+                        readLines(reader, false);
                         last = file.lastModified();
                     } else if (newer) {
                         /*
                          * This can happen if the file is truncated or overwritten with the exact same length of
-                         * information. In cases like this, the file position needs to be reset
+                         * information. In cases like this, the file position needs to be reopen and read
                          */
-                        position = 0;
-                        reader.seek(position); // cannot be null here
+                    	IOUtils.closeQuietly(reader);
+                    	reader = waitIfFileDoesNotExist();
+                    	position = 0;
+                    	if (reader == null) break;
 
                         // Now we can read new lines
-                        position = readLines(reader);
+                        readLines(reader, false);
                         last = file.lastModified();
                     }
                 }
@@ -467,8 +464,9 @@ public class Tailer implements Runnable {
                 }
                 Thread.sleep(delayMillis);
                 if (getRun() && reOpen) {
-                    reader = new RandomAccessFile(file, RAF_MODE);
-                    reader.seek(position);
+                    reader = waitIfFileDoesNotExist();
+                    if (reader == null) break;
+                    reader.skip(position);
                 }
             }
         } catch (final InterruptedException e) {
@@ -480,6 +478,24 @@ public class Tailer implements Runnable {
             IOUtils.closeQuietly(reader);
         }
     }
+    
+	private CountingInputStream waitIfFileDoesNotExist() throws IOException,
+			InterruptedException {
+		CountingInputStream reader = null;
+		while (getRun() && reader == null) {
+			try {
+				reader = new CountingInputStream(Files.newInputStream(
+						file.toPath(), StandardOpenOption.READ));
+			} catch (NoSuchFileException e) {
+				listener.fileNotFound();
+				Thread.sleep(delayMillis);
+			} catch (FileSystemException e) {
+				listener.handle(e);
+				Thread.sleep(delayMillis);
+			}
+		}
+		return reader;
+	}
 
     private void stop(final Exception e) {
         listener.handle(e);
@@ -500,10 +516,7 @@ public class Tailer implements Runnable {
      * @return The new position after the lines have been read
      * @throws java.io.IOException if an I/O error occurs.
      */
-    private long readLines(final RandomAccessFile reader) throws IOException {
-        ByteArrayOutputStream lineBuf = new ByteArrayOutputStream(64);
-        long pos = reader.getFilePointer();
-        long rePos = pos; // position to re-read
+    private void readLines(final CountingInputStream reader, boolean flush) throws IOException {
         int num;
         boolean seenCR = false;
         while (getRun() && ((num = reader.read(inbuf)) != EOF)) {
@@ -512,9 +525,7 @@ public class Tailer implements Runnable {
                 switch (ch) {
                 case '\n':
                     seenCR = false; // swallow CR before LF
-                    listener.handle(new String(lineBuf.toByteArray(), cset));
-                    lineBuf.reset();
-                    rePos = pos + i + 1;
+                    sendToListener();
                     break;
                 case '\r':
                     if (seenCR) {
@@ -525,18 +536,21 @@ public class Tailer implements Runnable {
                 default:
                     if (seenCR) {
                         seenCR = false; // swallow final CR
-                        listener.handle(new String(lineBuf.toByteArray(), cset));
-                        lineBuf.reset();
-                        rePos = pos + i + 1;
+                        sendToListener();
                     }
                     lineBuf.write(ch);
                 }
             }
-            pos = reader.getFilePointer();
         }
-        IOUtils.closeQuietly(lineBuf); // not strictly necessary
-        reader.seek(rePos); // Ensure we can re-read if necessary
-        return rePos;
+        if (flush && lineBuf.size() > 0) {
+        	sendToListener();
+        }
+        position = reader.getByteCount();
     }
+
+	private void sendToListener() {
+		listener.handle(new String(lineBuf.toByteArray(), cset));
+		lineBuf.reset();
+	}
 
 }
