@@ -408,16 +408,12 @@ public class Tailer implements Runnable {
     public void run() {
     	CountingInputStream reader = null;
         try {
-            long last = 0; // The last time the file was checked for changes
-            // Open the file
             reader = waitIfFileDoesNotExist();
             if (reader == null) return;
             
-        	last = file.lastModified();
         	position = end ? file.length() : 0;
             position = reader.skip(position);
             while (getRun()) {
-                final boolean newer = FileUtils.isFileNewer(file, last); // IO-279, must be done first
                 // Check the file length to see if it was rotated
                 final long length = file.length();
                 if (length < position) {
@@ -437,27 +433,8 @@ public class Tailer implements Runnable {
                     position = 0;
                     if (reader == null) break;
                     continue;
-                } else {
-                    // File was not rotated
-                    // See if the file needs to be read again
-                    if (length > position) {
-                        // The file has more content than it did last time
-                        readLines(reader, false);
-                        last = file.lastModified();
-                    } else if (newer) {
-                        /*
-                         * This can happen if the file is truncated or overwritten with the exact same length of
-                         * information. In cases like this, the file position needs to be reopen and read
-                         */
-                    	IOUtils.closeQuietly(reader);
-                    	reader = waitIfFileDoesNotExist();
-                    	position = 0;
-                    	if (reader == null) break;
-
-                        // Now we can read new lines
-                        readLines(reader, false);
-                        last = file.lastModified();
-                    }
+                } else if (length > position) {
+                	readLines(reader, false);
                 }
                 if (reOpen) {
                     IOUtils.closeQuietly(reader);
@@ -507,6 +484,10 @@ public class Tailer implements Runnable {
      */
     public void stop() {
         this.run = false;
+    }
+    
+    public long getPosition() {
+    	return this.position;
     }
 
     /**
